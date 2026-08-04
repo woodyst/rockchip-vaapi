@@ -32,6 +32,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <unistd.h>
+#ifdef HAVE_RGA
+#include <rga/im2d.h>
+#include <rga/rga.h>
+#endif
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
@@ -45,8 +49,9 @@ static void log_init(void) {
     const char *p = getenv("RK_VAAPI_LOG");
     if (p && *p) g_log_fp = fopen(p, "a");
 }
-#define LOG(fmt, ...) do { if (g_log_fp) \
+#define LOG(fmt, ...) do { if (g_log_fp) { \
     fprintf(g_log_fp, "[rk-vaapi pid=%d] " fmt "\n", getpid(), ##__VA_ARGS__); \
+    fflush(g_log_fp); } \
 } while(0)
 
 /* ── limits ──────────────────────────────────────────────────── */
@@ -318,10 +323,24 @@ static VAStatus rk_QueryConfigAttributes(VADriverContextP ctx,
     RKDriver *d = drv_from_ctx(ctx);
     RKConfig *c = config_by_id(d, id);
     if (!c) return VA_STATUS_ERROR_INVALID_CONFIG;
-    (void)attribs;
     *profile = c->profile;
     *entrypoint = c->entrypoint;
-    *n = 0;
+
+    /* Chromium reads VAConfigAttribRTFormat here to decide which internal
+       formats a profile supports; finding none, it treats the profile as
+       unsupported.  NOTE: it passes an UNINITIALISED int as *n
+       (`int num_config_attributes;`), so *n must not be read as an input
+       capacity -- always write when attribs is non-NULL.  Otherwise Chromium
+       reads a zero-filled entry whose type happens to equal
+       VAConfigAttribRTFormat (enum value 0) with value 0, i.e. "no formats". */
+    if (attribs) {
+        attribs[0].type  = VAConfigAttribRTFormat;
+        attribs[0].value = VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
+    }
+    *n = 1;
+    LOG("QueryConfigAttributes: profile=%d entrypoint=%d -> RTFormat=0x%x",
+        c->profile, c->entrypoint,
+        (unsigned)(VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10));
     return VA_STATUS_SUCCESS;
 }
 
@@ -670,19 +689,51 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     int  copied = 0;
     void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
     void *dst = s->priv_buf ? mpp_buffer_get_ptr(s->priv_buf) : NULL;
-    if (src && dst) {
+    /* The destination layout must match what ExportSurfaceHandle already
+       reported, not MPP's frame stride.  Clients import the dma-buf once --
+       Chromium does so at frame-pool creation, before any decode -- and never
+       re-read the layout, so writing at MPP's stride puts the chroma plane at
+       the wrong offset.  MPP does not use the alignment the surface was
+       created with; observed on RK3588:
+           3840x2160 -> MPP frame stride 3840x2176
+           1920x1080 -> MPP frame stride 2304x1088
+       Re-stride here instead: read with src_hs, write with dst_hs. */
+    int dst_hs = s->hstride ? s->hstride : copy_w;
+    int dst_vs = s->vstride ? s->vstride : copy_h;
+#ifdef HAVE_RGA
+    /* Offload the plane copy to RGA, the RK3588 2D blitter, which handles
+       strided NV12->NV12 in hardware, dma-buf to dma-buf.  At 4K the CPU
+       memcpy moves 12.4MB per frame (~6ms, about a third of the 16.7ms budget
+       at 60fps) on the decode path, which shows up as dropped frames.
+       10-bit/P010 keeps the CPU path; memcpy stays the fallback. */
+    if (!i10 && buf && s->priv_buf) {
+        int sfd = mpp_buffer_get_fd(buf);
+        int dfd = mpp_buffer_get_fd(s->priv_buf);
+        if (sfd > 0 && dfd > 0) {
+            rga_buffer_t rs = wrapbuffer_fd_t(sfd, copy_w, copy_h, src_hs, src_vs,
+                                              RK_FORMAT_YCbCr_420_SP);
+            rga_buffer_t rd = wrapbuffer_fd_t(dfd, copy_w, copy_h, dst_hs, dst_vs,
+                                              RK_FORMAT_YCbCr_420_SP);
+            if (imcopy_t(rs, rd, 1) == IM_STATUS_SUCCESS)
+                copied = 2;   /* 2 = RGA hardware blit */
+        }
+    }
+#endif
+    if (!copied && src && dst) {
         const uint8_t *sy = (const uint8_t *)src;
         uint8_t       *dy = (uint8_t       *)dst;
+        int row_bytes = (copy_w < dst_hs ? copy_w : dst_hs) * bpp;
+        if (row_bytes > src_hs * bpp) row_bytes = src_hs * bpp;
         for (int r = 0; r < copy_h; r++)
-            memcpy(dy + (size_t)r * src_hs * bpp,
+            memcpy(dy + (size_t)r * dst_hs * bpp,
                    sy + (size_t)r * src_hs * bpp,
-                   (size_t)src_hs * bpp);
+                   (size_t)row_bytes);
         const uint8_t *su = sy + (size_t)src_hs * src_vs * bpp;
-        uint8_t       *du = dy + (size_t)src_hs * src_vs * bpp;
+        uint8_t       *du = dy + (size_t)dst_hs * dst_vs * bpp;
         for (int r = 0; r < copy_h / 2; r++)
-            memcpy(du + (size_t)r * src_hs * bpp,
+            memcpy(du + (size_t)r * dst_hs * bpp,
                    su + (size_t)r * src_hs * bpp,
-                   (size_t)src_hs * bpp);
+                   (size_t)row_bytes);
         copied = 1;
     }
     mpp_frame_deinit(&frame);
@@ -692,8 +743,10 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     s->fmt    = ffmt;
     if (fwidth  > 0) s->width   = fwidth;
     if (fheight > 0) s->height  = fheight;
-    if (fhs     > 0) s->hstride = fhs;
-    if (fvs     > 0) s->vstride = fvs;
+    /* hstride/vstride are deliberately NOT updated from the MPP frame: they
+       describe the layout already handed to the client by ExportSurfaceHandle.
+       Changing them would desynchronise the importer's view of the buffer.
+       The copy above re-strides into this fixed layout. */
     s->decoded  = true;
     pthread_cond_signal(&s->cond);
     pthread_mutex_unlock(&s->lock);
@@ -782,28 +835,40 @@ static VAStatus do_h264_decode(RKContext *c, RKDriver *d)
     mpp_packet_set_length(pkt, pkt_sz);
     mpp_packet_set_pts(pkt, (RK_S64)c->render_target);
 
-    MPP_RET ret = c->mpi->decode_put_packet(c->mpp, pkt);
+    /* MPP_ERR_BUFFER_FULL is backpressure, not a stream error: the decoder's
+       input queue is full because output frames have not been drained yet.
+       Drain the output queue and retry rather than discarding the packet. */
+    MPP_RET ret = MPP_OK;
+    for (int attempt = 0; attempt < 200; attempt++) {
+        ret = c->mpi->decode_put_packet(c->mpp, pkt);
+        if (ret == MPP_OK || ret != MPP_ERR_BUFFER_FULL)
+            break;
+        MppFrame df = NULL;
+        while (c->mpi->decode_get_frame(c->mpp, &df) == MPP_OK && df) {
+            assign_mpp_frame(df, c, d);
+            df = NULL;
+        }
+        usleep(500);
+    }
     mpp_packet_deinit(&pkt);
     free(pkt_data);
 
     if (ret != MPP_OK) {
-        LOG("decode_put_packet failed: %d", ret);
+        LOG("decode_put_packet failed after retries: %d", ret);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
 
-    for (int tries = 0; tries < 100; tries++) {
-        RKSurface *tgt = surface_by_id(d, c->render_target);
-        if (tgt) {
-            pthread_mutex_lock(&tgt->lock);
-            bool done = tgt->decoded;
-            pthread_mutex_unlock(&tgt->lock);
-            if (done) break;
-        }
-        MppFrame frame = NULL;
-        if (c->mpi->decode_get_frame(c->mpp, &frame) == MPP_OK && frame)
-            assign_mpp_frame(frame, c, d);
-        else
-            usleep(1000);
+    /* Do NOT block waiting for THIS surface to come out.  With B-frames MPP
+       cannot emit it until later frames have been submitted, so the wait always
+       runs to its limit: 100 tries x 1ms = ~100ms per frame, i.e. ~10fps, and
+       1080p ends up decoding SLOWER than 4K.  Measured on a 1080p29.97 stream
+       with has_b_frames=2: 0.56x realtime, versus 4.5x in software.
+       Waiting is vaSyncSurface's job, and rk_SyncSurface() already drains MPP
+       with a 3s deadline.  Here, just collect whatever is already available. */
+    MppFrame frame = NULL;
+    while (c->mpi->decode_get_frame(c->mpp, &frame) == MPP_OK && frame) {
+        assign_mpp_frame(frame, c, d);
+        frame = NULL;
     }
 
     return VA_STATUS_SUCCESS;
@@ -903,12 +968,26 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
     mpp_packet_set_length(pkt, pkt_sz);
     mpp_packet_set_pts(pkt, (RK_S64)c->render_target);
 
-    MPP_RET ret = c->mpi->decode_put_packet(c->mpp, pkt);
+    /* MPP_ERR_BUFFER_FULL is backpressure, not a stream error: the decoder's
+       input queue is full because output frames have not been drained yet.
+       Drain the output queue and retry rather than discarding the packet. */
+    MPP_RET ret = MPP_OK;
+    for (int attempt = 0; attempt < 200; attempt++) {
+        ret = c->mpi->decode_put_packet(c->mpp, pkt);
+        if (ret == MPP_OK || ret != MPP_ERR_BUFFER_FULL)
+            break;
+        MppFrame df = NULL;
+        while (c->mpi->decode_get_frame(c->mpp, &df) == MPP_OK && df) {
+            assign_mpp_frame(df, c, d);
+            df = NULL;
+        }
+        usleep(500);
+    }
     mpp_packet_deinit(&pkt);
     free(pkt_data);
 
     if (ret != MPP_OK) {
-        LOG("decode_put_packet failed: %d", ret);
+        LOG("decode_put_packet failed after retries: %d", ret);
         if (!is_hidden) c->dq_tail = (c->dq_tail - 1) & 63; /* undo enqueue */
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
@@ -1372,7 +1451,7 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
         config, attrib_list ? "provided" : "NULL (query count)");
 
     /* Firefox calls this twice: first with NULL to get count, then with buffer */
-    const unsigned int n = 4;
+    const unsigned int n = 7;
     if (!attrib_list) {
         *num_attribs = n;
         return VA_STATUS_SUCCESS;
@@ -1407,6 +1486,21 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
     attrib_list[3].flags             = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[3].value.type        = VAGenericValueTypeInteger;
     attrib_list[3].value.value.i     = 7680;
+
+    attrib_list[4].type              = VASurfaceAttribMaxHeight;
+    attrib_list[4].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[4].value.type        = VAGenericValueTypeInteger;
+    attrib_list[4].value.value.i     = 4320;
+
+    attrib_list[5].type              = VASurfaceAttribMinWidth;
+    attrib_list[5].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[5].value.type        = VAGenericValueTypeInteger;
+    attrib_list[5].value.value.i     = 16;
+
+    attrib_list[6].type              = VASurfaceAttribMinHeight;
+    attrib_list[6].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[6].value.type        = VAGenericValueTypeInteger;
+    attrib_list[6].value.value.i     = 16;
 
     *num_attribs = n;
     LOG("QuerySurfaceAttributes: returned %u attribs (NV12, P010, DRM_PRIME_2)", n);
