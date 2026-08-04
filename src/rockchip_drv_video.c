@@ -45,8 +45,9 @@ static void log_init(void) {
     const char *p = getenv("RK_VAAPI_LOG");
     if (p && *p) g_log_fp = fopen(p, "a");
 }
-#define LOG(fmt, ...) do { if (g_log_fp) \
+#define LOG(fmt, ...) do { if (g_log_fp) { \
     fprintf(g_log_fp, "[rk-vaapi pid=%d] " fmt "\n", getpid(), ##__VA_ARGS__); \
+    fflush(g_log_fp); } \
 } while(0)
 
 /* ── limits ──────────────────────────────────────────────────── */
