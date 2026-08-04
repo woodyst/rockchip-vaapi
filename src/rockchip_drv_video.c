@@ -783,12 +783,26 @@ static VAStatus do_h264_decode(RKContext *c, RKDriver *d)
     mpp_packet_set_length(pkt, pkt_sz);
     mpp_packet_set_pts(pkt, (RK_S64)c->render_target);
 
-    MPP_RET ret = c->mpi->decode_put_packet(c->mpp, pkt);
+    /* MPP_ERR_BUFFER_FULL is backpressure, not a stream error: the decoder's
+       input queue is full because output frames have not been drained yet.
+       Drain the output queue and retry rather than discarding the packet. */
+    MPP_RET ret = MPP_OK;
+    for (int attempt = 0; attempt < 200; attempt++) {
+        ret = c->mpi->decode_put_packet(c->mpp, pkt);
+        if (ret == MPP_OK || ret != MPP_ERR_BUFFER_FULL)
+            break;
+        MppFrame df = NULL;
+        while (c->mpi->decode_get_frame(c->mpp, &df) == MPP_OK && df) {
+            assign_mpp_frame(df, c, d);
+            df = NULL;
+        }
+        usleep(500);
+    }
     mpp_packet_deinit(&pkt);
     free(pkt_data);
 
     if (ret != MPP_OK) {
-        LOG("decode_put_packet failed: %d", ret);
+        LOG("decode_put_packet failed after retries: %d", ret);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
 
@@ -904,12 +918,26 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
     mpp_packet_set_length(pkt, pkt_sz);
     mpp_packet_set_pts(pkt, (RK_S64)c->render_target);
 
-    MPP_RET ret = c->mpi->decode_put_packet(c->mpp, pkt);
+    /* MPP_ERR_BUFFER_FULL is backpressure, not a stream error: the decoder's
+       input queue is full because output frames have not been drained yet.
+       Drain the output queue and retry rather than discarding the packet. */
+    MPP_RET ret = MPP_OK;
+    for (int attempt = 0; attempt < 200; attempt++) {
+        ret = c->mpi->decode_put_packet(c->mpp, pkt);
+        if (ret == MPP_OK || ret != MPP_ERR_BUFFER_FULL)
+            break;
+        MppFrame df = NULL;
+        while (c->mpi->decode_get_frame(c->mpp, &df) == MPP_OK && df) {
+            assign_mpp_frame(df, c, d);
+            df = NULL;
+        }
+        usleep(500);
+    }
     mpp_packet_deinit(&pkt);
     free(pkt_data);
 
     if (ret != MPP_OK) {
-        LOG("decode_put_packet failed: %d", ret);
+        LOG("decode_put_packet failed after retries: %d", ret);
         if (!is_hidden) c->dq_tail = (c->dq_tail - 1) & 63; /* undo enqueue */
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
