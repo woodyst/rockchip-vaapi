@@ -1,5 +1,7 @@
 # rockchip-vaapi
 
+*English · [Español](README.es.md)*
+
 VA-API driver for Rockchip RK3588 / RK3576 that bridges **libva** to
 **librockchip-mpp** (MPP), enabling hardware-accelerated video decode in
 applications such as Firefox.
@@ -20,7 +22,7 @@ library, which in turn uses the hardware VPU.
 
 Key features:
 
-- H.264 / HEVC / VP9 / AV1 hardware decode
+- H.264 / HEVC / VP9 hardware decode (AV1 is not advertised, see below)
 - Zero-copy DRM PRIME 2 surface export (NV12, DMABUF)
 - Compatible with Firefox 128+ (VA-API PDM path, RDD process)
 - Implements the full VA-API 1.20 vtable (`__vaDriverInit_1_20`)
@@ -40,7 +42,30 @@ Key features:
 | H.264 | Constrained Baseline, Main, High, High10 | 4K |
 | HEVC | Main, Main10 | 8K |
 | VP9 | Profile 0, 2 | 8K |
-| AV1 | Profile 0, 1 | 8K |
+
+AV1 is **not advertised**: MPP needs a complete OBU bitstream, which VA-API
+does not provide, so browsers fall back to VP9, which is hardware-decoded.
+
+## What's new in 1.0.12
+
+Fixes YouTube H.264 videos that kept reloading in Firefox
+(`NS_ERROR_DOM_MEDIA_FATAL_ERR` in a loop):
+
+- **H.264 PPS reference defaults.** The rebuilt PPS always said "1 reference
+  by default". Streams with a different default (YouTube 720p60 uses 3, with
+  weighted prediction) were misparsed by the VPU: after a few hundred frames
+  the picture drifted and decoding timed out. The driver now learns the real
+  defaults from the slice headers.
+- **B-frame deadlock.** MPP held back frames the player was waiting for.
+  H.264 frames are now emitted as soon as they are decoded.
+- **Backpressure and logging** (from [PR #2](https://github.com/woodyst/rockchip-vaapi/pull/2)
+  by TruongSinh Tran-Nguyen): a full MPP input queue is no longer a fatal
+  error, and `RK_VAAPI_LOG` is flushed after every line.
+
+Result on a YouTube 720p60 H.264 clip: 2107/2107 frames bit-identical to
+software decoding (1.0.11: 506/2107). Details in
+[debian/changelog](debian/changelog) and
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#pps-num_ref_idx-defaults-since-1012).
 
 ## Dependencies
 
@@ -77,11 +102,19 @@ In Firefox, also enable via `about:config`:
 
 ## Verifying hardware decode
 
-After starting Firefox and playing a video, check the driver log:
+Logging is off by default. Set `RK_VAAPI_LOG` to a file path, play a video,
+and check the log:
 
 ```bash
-# Should show mpp_create OK, BeginPicture, EndPicture, ExportSurfaceHandle
-LIBVA_DRIVER_NAME=rockchip MOZ_DISABLE_RDD_SANDBOX=1 firefox 2>&1 | grep rk-vaapi
+LIBVA_DRIVER_NAME=rockchip MOZ_DISABLE_RDD_SANDBOX=1 RK_VAAPI_LOG=/tmp/rk.log firefox
+# Should show BeginPicture, EndPicture, assign_mpp_frame, ExportSurfaceHandle
+grep -c assign_mpp_frame /tmp/rk.log
+```
+
+If a video keeps reloading, count Firefox's decoder errors:
+
+```bash
+journalctl -b --since "-10min" | grep -c NS_ERROR_DOM_MEDIA_FATAL_ERR
 ```
 
 You can also check VPU activity:
@@ -122,6 +155,11 @@ The AI assisted with: architecture design, VA-API vtable implementation,
 H.264 Annex B SPS/PPS reconstruction via Exp-Golomb encoding, MPP API
 integration, DMABUF/DRM PRIME 2 surface export, and iterative debugging of
 Firefox integration issues.
+
+The 1.0.12 H.264 fixes (PPS reference defaults, `fast_out`) were diagnosed
+and implemented with **Claude Opus 5.5** (`claude-opus-5-5`) on 24 September
+2026, by reproducing the Firefox failure with mpv and comparing every frame
+against software decoding.
 
 All code was reviewed, tested, and validated on real hardware by
 Eduardo García-Mádico Portabella — EGP Sistemas.

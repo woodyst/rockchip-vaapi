@@ -38,7 +38,8 @@ rockchip-vaapi/
 ├── docs/
 │   └── DEVELOPMENT.md         # This file
 ├── Makefile
-├── README.md
+├── README.md                  # English
+├── README.es.md               # Español
 └── INSTALL.md
 ```
 
@@ -132,13 +133,56 @@ using Exp-Golomb coding:
    any `0x000001` or `0x000002` sequences (required by the H.264 spec).
 5. A 4-byte Annex B start code (`00 00 00 01`) is prepended to the output.
 
+### PPS `num_ref_idx` defaults (since 1.0.12)
+
+`VAPictureParameterBufferH264` does not carry the PPS fields
+`num_ref_idx_l0_default_active_minus1` / `num_ref_idx_l1_default_active_minus1`.
+They are not cosmetic: a slice whose header has
+`num_ref_idx_active_override_flag = 0` uses them to parse
+`ref_pic_list_modification()` and `pred_weight_table()`. Up to 1.0.11 the
+driver wrote 0 for both, so MPP misparsed every non-overriding P/B slice of
+streams with a different default (YouTube 720p60 H.264 uses l0 = 2 with
+explicit weighted prediction). The symptom was output drifting to stale or
+corrupt frames after a few hundred frames, then a `SyncSurface` timeout that
+Firefox reports as `NS_ERROR_DOM_MEDIA_FATAL_ERR`.
+
+The fix recovers the original values from the stream itself:
+
+1. `h264_slice_ref_override()` (`h264.c`) parses the start of each slice
+   header (with emulation-prevention bytes removed) up to
+   `num_ref_idx_active_override_flag`. It uses the SPS/PPS fields in the VA
+   picture parameters to know the width of `frame_num`, `pic_order_cnt_lsb`
+   and the other optional fields.
+2. For a slice that does **not** override, the effective counts in its
+   `VASliceParameterBufferH264` (`num_ref_idx_l0/l1_active_minus1`) are, by
+   definition, the PPS defaults. The context stores them in
+   `pps_l0_def` / `pps_l1_def` (l1 is learned only from B slices).
+3. `do_h264_decode` sends the SPS+PPS before each IDR as before, and resends
+   the PPS alone before any picture where the learned defaults change.
+
+I slices carry no reference counts, so the placeholder 0 written before the
+first P/B slice is harmless.
+
+### MPP output order (`fast_out`)
+
+By default MPP outputs H.264 frames in display order and holds back as many
+frames as its DPB allows, which can be more than the client's own reorder
+delay (`max_num_reorder_frames`). A client that calls `vaSyncSurface` on a
+surface MPP is still holding waits for output, while MPP waits for more
+input: a deadlock that ends in a timeout. Since 1.0.12 the driver sets
+`base:fast_out = 1` for H.264, so each frame is emitted as soon as it is
+decoded; the client (FFmpeg) already does its own reordering, and frames are
+routed back to their surface by PTS. Without it, frames are lost on B-frame
+content.
+
 ### Slice dispatch (`do_h264_decode`)
 
 For each `EndPicture` call the driver:
 
 1. Finds the `VAPictureParameterBufferH264` and all `VASliceDataBuffer` blobs
    in `pending[]`.
-2. On IDR frames (detected via `nal_ref_idc` / slice type), prepends SPS+PPS.
+2. On IDR frames (detected via `nal_unit_type`), prepends SPS+PPS; resends
+   the PPS whenever the learned `num_ref_idx` defaults change.
 3. Prepends `00 00 00 01` start codes to each slice NALU.
 4. Packs everything into a single MPP packet; encodes the target surface ID
    as the packet `pts` (used to route the decoded frame back to the right
@@ -328,8 +372,6 @@ patching Firefox's sandbox policy).
 - H.264 SPS reconstruction uses `level_idc=51` (5.1) unconditionally. The
   actual level is not exposed by `VAPictureParameterBufferH264`; 5.1 is safe
   for all content up to 4K@60fps.
-- `num_ref_idx_l0/l1_default` in PPS is hardcoded to 0 (= 1 reference).
-  Multi-reference B-frame content may require this to match the stream.
 - Maximum 64 surfaces / 8 concurrent decode contexts. Increase `MAX_SURFACES`
   and `MAX_CONTEXTS` if needed.
 - Only H.264 header reconstruction is implemented. HEVC/VP9/AV1 decode paths

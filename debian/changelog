@@ -1,3 +1,32 @@
+rockchip-vaapi (1.0.12-1) noble; urgency=high
+
+  * H.264: fix PPS num_ref_idx defaults. The reconstructed PPS always wrote
+    num_ref_idx_l0/l1_default_active_minus1 = 0. Slices that do not set
+    num_ref_idx_active_override_flag use those defaults to parse
+    ref_pic_list_modification() and pred_weight_table(), so on streams whose
+    real default differs (e.g. YouTube 720p60 H.264: l0 default = 2 with
+    explicit weighted prediction) MPP misparsed the slice headers. Output
+    drifted to stale or corrupt frames after ~500 frames and SyncSurface
+    finally timed out; Firefox reported NS_ERROR_DOM_MEDIA_FATAL_ERR and
+    recreated the decoder in a loop (the video kept reloading). The driver
+    now parses the start of each slice header, learns the defaults from
+    slices that do not override them, and resends the PPS when they change.
+  * H.264: enable MPP fast_out. In display order MPP held back more frames
+    than the client's reorder delay, so vaSyncSurface on a held surface
+    deadlocked on B-frame content. Frames are now emitted as soon as they are
+    decoded and routed back to their surface by PTS.
+  * Treat MPP_ERR_BUFFER_FULL from decode_put_packet as backpressure (drain
+    and retry) instead of a fatal decoding error. Patch by TruongSinh
+    Tran-Nguyen (GitHub PR #2).
+  * Flush the RK_VAAPI_LOG file after every write, so the log of a running
+    process is readable. Patch by TruongSinh Tran-Nguyen (GitHub PR #2).
+  * Verified on a YouTube 720p60 H.264 clip: 2107/2107 frames bit-identical to
+    software decoding (was 506/2107); mpv decodes the whole clip with no
+    timeouts (the previous version timed out at frame 509 on every run).
+    VP9 barcode tests (lossless, altref, 4K altref) still pass.
+
+ -- Eduardo García-Mádico Portabella <woodyst@gmail.com>  Thu, 24 Sep 2026 14:30:00 +0200
+
 rockchip-vaapi (1.0.11-1) noble; urgency=high
 
   * Fix 4K@60fps stability: >30000 frames decoded without NS_ERROR in Firefox,
