@@ -122,7 +122,8 @@ int h264_write_sps(uint8_t *buf, size_t buf_size,
 }
 
 int h264_write_pps(uint8_t *buf, size_t buf_size,
-                   const VAPictureParameterBufferH264 *pp)
+                   const VAPictureParameterBufferH264 *pp,
+                   int l0_default_minus1, int l1_default_minus1)
 {
     uint8_t raw[256];
     BSWriter bs;
@@ -137,9 +138,13 @@ int h264_write_pps(uint8_t *buf, size_t buf_size,
     bs_write(&bs, pp->pic_fields.bits.pic_order_present_flag, 1);
     bs_write_ue(&bs, 0); /* num_slice_groups_minus1 = 0 */
 
-    /* num_ref_idx_l0/l1_default: use conservative default (0 = 1 ref) */
-    bs_write_ue(&bs, 0);
-    bs_write_ue(&bs, 0);
+    /* num_ref_idx_l0/l1_default_active_minus1 are not in the VA picture
+     * params.  They matter: a slice with num_ref_idx_active_override_flag=0
+     * uses them to parse its ref list modifications and pred_weight_table,
+     * so a wrong value misparses the slice header.  The caller learns them
+     * from non-overriding slices (see h264_slice_ref_override). */
+    bs_write_ue(&bs, (uint32_t)l0_default_minus1);
+    bs_write_ue(&bs, (uint32_t)l1_default_minus1);
 
     bs_write(&bs, pp->pic_fields.bits.weighted_pred_flag, 1);
     bs_write(&bs, pp->pic_fields.bits.weighted_bipred_idc, 2);
@@ -167,4 +172,85 @@ int h264_write_pps(uint8_t *buf, size_t buf_size,
     size_t ep = emulation_prevent(raw, raw_sz, buf + 4, buf_size - 4);
     if (!ep) return -1;
     return (int)(4 + ep);
+}
+
+/* Minimal RBSP bit reader for the start of a slice header */
+typedef struct {
+    uint8_t buf[64];
+    size_t  len, pos;   /* pos in bits */
+    int     err;
+} BSReader;
+
+static void br_init(BSReader *br, const uint8_t *nal, size_t size) {
+    int zeros = 0;
+    br->len = br->pos = 0;
+    br->err = 0;
+    for (size_t i = 0; i < size && br->len < sizeof(br->buf); i++) {
+        if (zeros >= 2 && nal[i] == 0x03) { zeros = 0; continue; }
+        br->buf[br->len++] = nal[i];
+        zeros = (nal[i] == 0) ? zeros + 1 : 0;
+    }
+}
+
+static uint32_t br_bit(BSReader *br) {
+    if (br->pos >= br->len * 8) { br->err = 1; return 0; }
+    uint32_t b = (br->buf[br->pos >> 3] >> (7 - (br->pos & 7))) & 1;
+    br->pos++;
+    return b;
+}
+
+static uint32_t br_bits(BSReader *br, int n) {
+    uint32_t v = 0;
+    while (n--) v = (v << 1) | br_bit(br);
+    return v;
+}
+
+static uint32_t br_ue(BSReader *br) {
+    int lz = 0;
+    while (!br_bit(br) && !br->err && lz < 32) lz++;
+    if (lz >= 32) { br->err = 1; return 0; }
+    return ((1u << lz) - 1) + br_bits(br, lz);
+}
+
+static void br_se(BSReader *br) { (void)br_ue(br); }
+
+int h264_slice_ref_override(const uint8_t *nal, size_t size,
+                            const VAPictureParameterBufferH264 *pp)
+{
+    if (!nal || size < 2) return -1;
+    int nal_type = nal[0] & 0x1F;
+    if (nal_type != 1 && nal_type != 5) return -1;
+
+    BSReader br;
+    br_init(&br, nal + 1, size - 1);
+
+    br_ue(&br);                                   /* first_mb_in_slice */
+    int slice_type = (int)(br_ue(&br) % 5);
+    if (slice_type == 2 || slice_type == 4) return -1;   /* I / SI */
+    br_ue(&br);                                   /* pic_parameter_set_id */
+    br_bits(&br, pp->seq_fields.bits.log2_max_frame_num_minus4 + 4);
+
+    int field_pic = 0;
+    if (!pp->seq_fields.bits.frame_mbs_only_flag) {
+        field_pic = (int)br_bit(&br);
+        if (field_pic) br_bit(&br);               /* bottom_field_flag */
+    }
+    if (nal_type == 5) br_ue(&br);                /* idr_pic_id */
+
+    int poc_type = pp->seq_fields.bits.pic_order_cnt_type;
+    int bottom_poc = pp->pic_fields.bits.pic_order_present_flag && !field_pic;
+    if (poc_type == 0) {
+        br_bits(&br, pp->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 + 4);
+        if (bottom_poc) br_se(&br);               /* delta_pic_order_cnt_bottom */
+    } else if (poc_type == 1 &&
+               !pp->seq_fields.bits.delta_pic_order_always_zero_flag) {
+        br_se(&br);                               /* delta_pic_order_cnt[0] */
+        if (bottom_poc) br_se(&br);               /* delta_pic_order_cnt[1] */
+    }
+    if (pp->pic_fields.bits.redundant_pic_cnt_present_flag)
+        br_ue(&br);                               /* redundant_pic_cnt */
+    if (slice_type == 1) br_bit(&br);             /* direct_spatial_mv_pred_flag */
+
+    int override = (int)br_bit(&br);
+    return br.err ? -1 : override;
 }

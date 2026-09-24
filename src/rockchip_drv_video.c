@@ -92,6 +92,7 @@ typedef struct {
     /* H.264 state for SPS/PPS reconstruction */
     VAPictureParameterBufferH264 last_pp;
     bool         sps_sent;
+    int          pps_l0_def, pps_l1_def;   /* num_ref_idx_lX_default_active_minus1 */
 } RKContext;
 
 typedef struct {
@@ -480,6 +481,14 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
         MppDecCfg dec_cfg = NULL;
         mpp_dec_cfg_init(&dec_cfg);
         mpp_dec_cfg_set_u32(dec_cfg, "base:split_parse", 0);
+        /* H.264 with B-frames: in display order MPP holds back more frames
+         * than the client's reorder delay, so vaSyncSurface on a surface it
+         * is holding deadlocks (client waits for output, MPP waits for
+         * input) → TIMEOUT → NS_ERROR_DOM_MEDIA_FATAL_ERR on YouTube.
+         * fast_out emits each frame as soon as it is decoded; the client does
+         * its own reordering, and assign_mpp_frame maps by PTS. */
+        if (coding == MPP_VIDEO_CodingAVC)
+            mpp_dec_cfg_set_u32(dec_cfg, "base:fast_out", 1);
         c->mpi->control(c->mpp, MPP_DEC_SET_CFG, dec_cfg);
         mpp_dec_cfg_deinit(dec_cfg);
 
@@ -492,6 +501,7 @@ static VAStatus rk_CreateContext(VADriverContextP ctx,
         c->height    = height;
         c->coding    = coding;
         c->sps_sent  = false;
+        c->pps_l0_def = c->pps_l1_def = 0;
 
         *out_id = CONTEXT_ID_BASE + i;
         return VA_STATUS_SUCCESS;
@@ -731,16 +741,50 @@ static VAStatus do_h264_decode(RKContext *c, RKDriver *d)
         break;
     }
 
-    /* SPS + PPS before every IDR (or first frame) */
-    if (is_idr || !c->sps_sent) {
+    /* Learn the PPS num_ref_idx defaults: a slice that does not override
+     * them uses the defaults, so its effective counts (from the VA slice
+     * params) are the original PPS values. */
+    int l0_def = c->pps_l0_def, l1_def = c->pps_l1_def;
+    {
+        const VASliceParameterBufferH264 *sp = NULL;
+        for (int i = 0; i < c->n_pending; i++) {
+            RKBuffer *b = buffer_by_id(d, c->pending[i]);
+            if (!b) continue;
+            if (b->type == VASliceParameterBufferType) {
+                sp = (const VASliceParameterBufferH264 *)b->data;
+            } else if (b->type == VASliceDataBufferType && sp) {
+                int ov = h264_slice_ref_override((const uint8_t *)b->data,
+                                                 (size_t)b->size * b->num_elements,
+                                                 &c->last_pp);
+                if (ov == 0) {
+                    l0_def = sp->num_ref_idx_l0_active_minus1;
+                    if (sp->slice_type % 5 == 1)   /* B */
+                        l1_def = sp->num_ref_idx_l1_active_minus1;
+                }
+                sp = NULL;
+            }
+        }
+    }
+    bool pps_changed = (l0_def != c->pps_l0_def || l1_def != c->pps_l1_def);
+    c->pps_l0_def = l0_def;
+    c->pps_l1_def = l1_def;
+
+    /* SPS + PPS before every IDR (or first frame); PPS again whenever the
+     * learned defaults change */
+    if (is_idr || !c->sps_sent || pps_changed) {
         uint8_t hdr[512];
-        int n = h264_write_sps(hdr, sizeof(hdr), &c->last_pp,
+        int n;
+        if (is_idr || !c->sps_sent) {
+            n = h264_write_sps(hdr, sizeof(hdr), &c->last_pp,
                                profile_idc(config_by_id(d, c->config_id)->profile));
+            if (n > 0) { PKT_APPEND(hdr, (size_t)n); }
+        }
+
+        n = h264_write_pps(hdr, sizeof(hdr), &c->last_pp, l0_def, l1_def);
         if (n > 0) { PKT_APPEND(hdr, (size_t)n); }
 
-        n = h264_write_pps(hdr, sizeof(hdr), &c->last_pp);
-        if (n > 0) { PKT_APPEND(hdr, (size_t)n); }
-
+        if (pps_changed)
+            LOG("do_h264_decode: PPS num_ref_idx defaults l0=%d l1=%d", l0_def, l1_def);
         c->sps_sent = true;
     }
 
