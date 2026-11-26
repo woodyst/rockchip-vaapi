@@ -36,6 +36,12 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <errno.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 
 #include "h264.h"
 
@@ -61,6 +67,10 @@ static void log_init(void) {
 #define CONTEXT_ID_BASE  0x02000000u
 #define SURFACE_ID_BASE  0x03000000u
 #define BUFFER_ID_BASE   0x04000000u
+
+/* DRM fourCCs for EGLImage plane import (local defines, avoid libdrm dep) */
+#define RK_DRM_FORMAT_R8    0x20203852u /* 'R8  ' */
+#define RK_DRM_FORMAT_GR88  0x38385247u /* 'GR88' */
 
 /* ── data structures ─────────────────────────────────────────── */
 
@@ -116,6 +126,7 @@ typedef struct {
 
     MppFrameFormat fmt;     /* pixel format of last decoded frame (0 = NV12 default) */
     bool         decoded;
+    bool         egl_import_failed;   /* DMA-BUF import failed once: CPU fallback */
     VAContextID  ctx_id;   /* context currently decoding into this surface */
     pthread_mutex_t  lock;
     pthread_cond_t   cond;
@@ -127,6 +138,10 @@ typedef struct {
     unsigned int   size;
     unsigned int   num_elements;
     void          *data;
+    /* VAImage metadata (valid when type == VAImageBufferType) */
+    unsigned int   img_fourcc;
+    int            img_w, img_h;
+    bool           acquired;   /* handle exported via AcquireBufferHandle */
 } RKBuffer;
 
 typedef struct {
@@ -134,6 +149,22 @@ typedef struct {
     RKContext  contexts[MAX_CONTEXTS];
     RKSurface  surfaces[MAX_SURFACES];
     RKBuffer   buffers [MAX_BUFFERS];
+
+    Display     *xdisp;
+    pthread_mutex_t xlock;
+    bool terminated;             /* set by Terminate under xlock */
+
+    /* GBM/EGL zero-copy display path */
+    int         egl_fails;        /* consecutive init failures (give up after 3) */
+    bool        egl_gl_failed;    /* GL program setup failed (don't retry per frame) */
+    bool        p010_warned;      /* one-shot P010 fallback notice */
+    EGLDisplay  egl_dpy;
+    EGLConfig   egl_conf;
+    EGLContext  egl_ctx;
+    EGLSurface  egl_sfc;          /* window surface for current drawable */
+    Drawable    egl_draw;         /* drawable egl_sfc was created for */
+    GLuint      egl_prog;
+    GLuint      egl_tex_y, egl_tex_uv;
 } RKDriver;
 
 /* ── helpers ─────────────────────────────────────────────────── */
@@ -191,10 +222,15 @@ static int profile_idc(VAProfile p) {
 
 /* ── VADriverVTable implementations ──────────────────────────── */
 
+static void egl_fini(RKDriver *d); /* defined in the EGL display section */
+
 static VAStatus rk_Terminate(VADriverContextP ctx) {
     LOG("Terminate: cleaning up driver");
     RKDriver *d = drv_from_ctx(ctx);
     if (!d) return VA_STATUS_SUCCESS;
+
+    pthread_mutex_lock(&d->xlock);
+    d->terminated = true;
 
     /* destroy any leftover objects */
     for (int i = 0; i < MAX_SURFACES; i++) {
@@ -213,6 +249,13 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
     for (int i = 0; i < MAX_BUFFERS; i++) {
         if (d->buffers[i].used) free(d->buffers[i].data);
     }
+    if (d->xdisp) {
+        egl_fini(d);
+        XCloseDisplay(d->xdisp);
+        d->xdisp = NULL;
+    }
+    pthread_mutex_unlock(&d->xlock);
+    pthread_mutex_destroy(&d->xlock);
     free(d);
     ctx->pDriverData = NULL;
     return VA_STATUS_SUCCESS;
@@ -576,7 +619,12 @@ static VAStatus rk_DestroyBuffer(VADriverContextP ctx, VABufferID id) {
     RKDriver *d = drv_from_ctx(ctx);
     RKBuffer *b = buffer_by_id(d, id);
     if (!b) return VA_STATUS_ERROR_INVALID_BUFFER;
-    free(b->data);
+    if (b->acquired) {
+        /* handle exported to client: leak b->data rather than dangle the pointer */
+        LOG("DestroyBuffer: buffer 0x%x still acquired, leaking data", (unsigned)id);
+    } else {
+        free(b->data);
+    }
     memset(b, 0, sizeof(*b));
     return VA_STATUS_SUCCESS;
 }
@@ -681,6 +729,8 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     int  copied = 0;
     void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
     void *dst = s->priv_buf ? mpp_buffer_get_ptr(s->priv_buf) : NULL;
+
+    pthread_mutex_lock(&s->lock);
     if (src && dst) {
         const uint8_t *sy = (const uint8_t *)src;
         uint8_t       *dy = (uint8_t       *)dst;
@@ -698,7 +748,6 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     }
     mpp_frame_deinit(&frame);
 
-    pthread_mutex_lock(&s->lock);
     s->frame  = NULL;
     s->fmt    = ffmt;
     if (fwidth  > 0) s->width   = fwidth;
@@ -1259,14 +1308,19 @@ static VAStatus rk_CreateImage(VADriverContextP ctx,
                                 int width, int height,
                                 VAImage *image) {
     RKDriver *d = drv_from_ctx(ctx);
-    (void)format;
 
     VABufferID buf_id;
     unsigned int stride = (unsigned int)((width + 15) & ~15);
-    unsigned int size   = stride * (unsigned int)height * 3 / 2;
-    VAStatus st = rk_CreateBuffer(ctx, 0, VAImageBufferType, size, 1,
-                                  NULL, &buf_id);
+    /* P010 stores 16-bit samples: twice the NV12 byte size */
+    bool is_10bit = (format->fourcc == VA_FOURCC_P010);
+    unsigned int size = is_10bit ? stride * (unsigned int)height * 3 : stride * (unsigned int)height * 3 / 2;
+    VAStatus st = rk_CreateBuffer(ctx, 0, VAImageBufferType, size, 1, NULL, &buf_id);
     if (st != VA_STATUS_SUCCESS) return st;
+
+    RKBuffer *ib = buffer_by_id(d, buf_id);
+    ib->img_fourcc = format->fourcc;
+    ib->img_w      = width;
+    ib->img_h      = height;
 
     memset(image, 0, sizeof(*image));
     image->image_id    = buf_id; /* reuse buf_id as image_id for simplicity */
@@ -1275,10 +1329,12 @@ static VAStatus rk_CreateImage(VADriverContextP ctx,
     image->width       = (unsigned short)width;
     image->height      = (unsigned short)height;
     image->num_planes  = 2;
-    image->pitches[0]  = stride;
-    image->pitches[1]  = stride;
+    /* pitches/offsets are in BYTES: P010 stores 16-bit samples (2x stride) */
+    unsigned int pitch_bytes = is_10bit ? stride * 2 : stride;
+    image->pitches[0]  = pitch_bytes;
+    image->pitches[1]  = pitch_bytes;
     image->offsets[0]  = 0;
-    image->offsets[1]  = stride * (unsigned int)height;
+    image->offsets[1]  = pitch_bytes * (unsigned int)height;
     image->data_size   = size;
     (void)d;
     return VA_STATUS_SUCCESS;
@@ -1294,11 +1350,6 @@ static VAStatus rk_DeriveImage(VADriverContextP ctx,
      * vaGetImage instead (copies pixels, but always works). */
     (void)image;
     return VA_STATUS_ERROR_OPERATION_FAILED;
-
-    VAImageFormat fmt;
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.fourcc = VA_FOURCC_NV12;
-    return rk_CreateImage(ctx, &fmt, s->width, s->height, image);
 }
 
 static VAStatus rk_DestroyImage(VADriverContextP ctx, VAImageID id) {
@@ -1350,7 +1401,55 @@ static VAStatus rk_PutImage(VADriverContextP ctx, VASurfaceID surface,
                              unsigned int src_width, unsigned int src_height,
                              int dest_x, int dest_y,
                              unsigned int dest_width, unsigned int dest_height)
-{ return VA_STATUS_SUCCESS; }
+{
+    RKDriver  *d  = drv_from_ctx(ctx);
+    RKSurface *s  = surface_by_id(d, surface);
+    RKBuffer  *ib = buffer_by_id(d, (VABufferID)image);
+    if (!s || !s->priv_buf) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!ib || ib->type != VAImageBufferType) return VA_STATUS_ERROR_INVALID_IMAGE;
+    if (ib->num_elements != 1) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    int iw = ib->img_w ? ib->img_w : s->width;
+    int ih = ib->img_h ? ib->img_h : s->height;
+    if (src_x != 0 || src_y != 0 || (int)src_width != iw || (int)src_height != ih ||
+        dest_x != 0 || dest_y != 0 || (int)dest_width != s->width ||
+        (int)dest_height != s->height || iw != s->width || ih != s->height)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    /* Format of the image (not the surface) decides sample width */
+    bool i10 = (ib->img_fourcc == VA_FOURCC_P010);
+    if (i10 != MPP_FRAME_FMT_IS_YUV_10BIT(s->fmt))
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    int  bpp = i10 ? 2 : 1;
+    int  img_hs = (iw + 15) & ~15;   /* 8-bit byte stride; real stride = img_hs*bpp */
+
+    /* If decode is in progress, sync first so we don't race the decoder */
+    pthread_mutex_lock(&s->lock);
+    bool needs_sync = !s->decoded && (s->ctx_id != 0);
+    pthread_mutex_unlock(&s->lock);
+    if (needs_sync) {
+        VAStatus st = rk_SyncSurface(ctx, surface);
+        if (st != VA_STATUS_SUCCESS) return st;
+    }
+
+    int hs = s->hstride ? s->hstride : s->width;
+    int vs = s->vstride ? s->vstride : s->height;
+
+    pthread_mutex_lock(&s->lock);
+    const uint8_t *sp = (const uint8_t *)ib->data;
+    uint8_t       *dp = (uint8_t *)mpp_buffer_get_ptr(s->priv_buf);
+    /* Y plane: copy the visible width only — a source row is img_hs*bpp
+     * bytes wide, shorter than the surface row hs*bpp when strides differ */
+    for (int r = 0; r < s->height; r++)
+        memcpy(dp + r * hs * bpp, sp + (size_t)r * img_hs * bpp, (size_t)s->width * bpp);
+    /* UV plane: src at img_hs*ih*bpp, dst at hs*vs */
+    const uint8_t *su = sp + (size_t)img_hs * ih * bpp;
+    uint8_t       *du = dp + (size_t)hs * vs * bpp;
+    for (int r = 0; r < s->height / 2; r++)
+        memcpy(du + r * hs * bpp, su + (size_t)r * img_hs * bpp, (size_t)s->width * bpp);
+    pthread_mutex_unlock(&s->lock);
+    return VA_STATUS_SUCCESS;
+}
 
 static VAStatus rk_QuerySubpicFmts(VADriverContextP ctx,
                                     VAImageFormat *format_list,
@@ -1432,10 +1531,45 @@ static VAStatus rk_LockSurface(VADriverContextP ctx, VASurfaceID surface,
                                 unsigned int *chroma_u_offset,
                                 unsigned int *chroma_v_offset,
                                 unsigned int *buffer_name, void **buffer)
-{ return VA_STATUS_ERROR_UNIMPLEMENTED; }
+{
+    RKDriver  *d = drv_from_ctx(ctx);
+    RKSurface *s = surface_by_id(d, surface);
+    if (!s || !s->priv_buf) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!buffer) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&s->lock);
+    bool needs_sync = !s->decoded && (s->ctx_id != 0);
+    pthread_mutex_unlock(&s->lock);
+    if (needs_sync) {
+        VAStatus st = rk_SyncSurface(ctx, surface);
+        if (st != VA_STATUS_SUCCESS) return st;
+    }
+
+    bool i10 = MPP_FRAME_FMT_IS_YUV_10BIT(s->fmt);
+    int  bpp = i10 ? 2 : 1;
+    int  hs  = s->hstride ? s->hstride : s->width;
+    int  vs  = s->vstride ? s->vstride : s->height;
+
+    *buffer = mpp_buffer_get_ptr(s->priv_buf);
+    if (fourcc)           *fourcc          = i10 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+    if (luma_stride)      *luma_stride     = (unsigned int)(hs * bpp);
+    if (chroma_u_stride)  *chroma_u_stride = (unsigned int)(hs * bpp);
+    /* semi-planar (NV12/P010): V is interleaved in the UV plane, so its offset/stride equal U's */
+    if (chroma_v_stride)  *chroma_v_stride = (unsigned int)(hs * bpp);
+    if (luma_offset)      *luma_offset     = 0;
+    if (chroma_u_offset)  *chroma_u_offset = (unsigned int)(hs * vs * bpp);
+    if (chroma_v_offset)  *chroma_v_offset = (unsigned int)(hs * vs * bpp);
+    if (buffer_name)      *buffer_name     = 0;
+    return VA_STATUS_SUCCESS;
+}
 
 static VAStatus rk_UnlockSurface(VADriverContextP ctx, VASurfaceID surface)
-{ return VA_STATUS_SUCCESS; }
+{
+    RKDriver  *d = drv_from_ctx(ctx);
+    RKSurface *s = surface_by_id(d, surface);
+    if (!s) return VA_STATUS_ERROR_INVALID_SURFACE;
+    return VA_STATUS_SUCCESS;
+}
 
 static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
                                       VASurfaceAttrib *attrib_list,
@@ -1445,7 +1579,7 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
         config, attrib_list ? "provided" : "NULL (query count)");
 
     /* Firefox calls this twice: first with NULL to get count, then with buffer */
-    const unsigned int n = 4;
+    const unsigned int n = 5;
     if (!attrib_list) {
         *num_attribs = n;
         return VA_STATUS_SUCCESS;
@@ -1481,6 +1615,11 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
     attrib_list[3].value.type        = VAGenericValueTypeInteger;
     attrib_list[3].value.value.i     = 7680;
 
+    attrib_list[4].type              = VASurfaceAttribMaxHeight;
+    attrib_list[4].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[4].value.type        = VAGenericValueTypeInteger;
+    attrib_list[4].value.value.i     = 7680;
+
     *num_attribs = n;
     LOG("QuerySurfaceAttributes: returned %u attribs (NV12, P010, DRM_PRIME_2)", n);
     return VA_STATUS_SUCCESS;
@@ -1488,10 +1627,37 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
 
 static VAStatus rk_AcquireBufferHandle(VADriverContextP ctx,
                                         VABufferID buf_id, VABufferInfo *buf_info)
-{ return VA_STATUS_ERROR_UNIMPLEMENTED; }
+{
+    RKDriver *d = drv_from_ctx(ctx);
+    if (!buf_info) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    RKBuffer *b = buffer_by_id(d, buf_id);
+    if (!b || b->acquired) return VA_STATUS_ERROR_INVALID_BUFFER;
 
-static VAStatus rk_ReleaseBufferHandle(VADriverContextP ctx, VABufferID buf_id)
-{ return VA_STATUS_SUCCESS; }
+    switch (buf_info->mem_type) {
+    case VA_SURFACE_ATTRIB_MEM_TYPE_VA:
+        /* Export the host pointer used by vaMapBuffer. */
+        buf_info->handle = (uintptr_t)b->data;
+        buf_info->mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+        b->acquired = true;
+        break;
+    default:
+        LOG("AcquireBufferHandle: mem_type 0x%x unsupported for CPU buffers "
+            "(DMA-BUF export only available via ExportSurfaceHandle)", buf_info->mem_type);
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+
+    buf_info->type     = b->type;
+    buf_info->mem_size = (size_t)b->size * b->num_elements;
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus rk_ReleaseBufferHandle(VADriverContextP ctx, VABufferID buf_id) {
+    RKDriver *d = drv_from_ctx(ctx);
+    RKBuffer *b = buffer_by_id(d, buf_id);
+    if (!b || !b->acquired) return VA_STATUS_ERROR_INVALID_BUFFER;
+    b->acquired = false;
+    return VA_STATUS_SUCCESS;
+}
 
 static VAStatus rk_CreateMFContext(VADriverContextP ctx,
                                     VAMFContextID *mfe_context)
@@ -1517,13 +1683,364 @@ static VAStatus rk_QueryProcessingRate(VADriverContextP ctx,
 
 static VAStatus rk_SyncBuffer(VADriverContextP ctx, VABufferID buf_id,
                                uint64_t timeout_ns)
-{ return VA_STATUS_SUCCESS; }
+{
+    (void)timeout_ns;
+    RKDriver *d = drv_from_ctx(ctx);
+    RKBuffer *b = buffer_by_id(d, buf_id);
+    if (!b) return VA_STATUS_ERROR_INVALID_BUFFER;
+    return VA_STATUS_SUCCESS;
+}
 
 static VAStatus rk_Copy(VADriverContextP ctx, VACopyObject *dst,
                          VACopyObject *src, VACopyOption option)
 { return VA_STATUS_ERROR_UNIMPLEMENTED; }
 
 #pragma GCC diagnostic pop
+
+static Display *x11_display(RKDriver *d) {
+    Display *xd;
+    pthread_mutex_lock(&d->xlock);
+    if (d->terminated) {
+        pthread_mutex_unlock(&d->xlock);
+        return NULL;
+    }
+    if (!d->xdisp)
+        d->xdisp = XOpenDisplay(NULL);
+    xd = d->xdisp;
+    pthread_mutex_unlock(&d->xlock);
+    return xd;
+}
+
+/* ── GBM/EGL zero-copy display path ──────────────────────────── */
+
+static const char *VTX_SRC =
+    "attribute vec2 a_pos;\n"
+    "attribute vec2 a_tex;\n"
+    "varying   vec2 v_tex;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+    "    v_tex = a_tex;\n"
+    "}\n";
+
+static const char *FRG_SRC =
+    "precision mediump float;\n"
+    "uniform sampler2D tex_y;\n"
+    "uniform sampler2D tex_uv;\n"
+    "uniform mat3     u_cmat;\n"
+    "varying   vec2     v_tex;\n"
+    "void main() {\n"
+    "    float y = texture2D(tex_y,  v_tex).r - 0.0625;\n"   /* limited-range black level */
+    "    vec2  c = texture2D(tex_uv, v_tex).ra - 0.5;\n"
+    "    gl_FragColor = vec4(clamp(u_cmat * vec3(y, c.x, c.y), 0.0, 1.0), 1.0);\n"
+    "}\n";
+
+static GLuint compile_shader(GLuint type, const char *src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok = GL_FALSE;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) { glDeleteShader(sh); return 0; }
+    return sh;
+}
+
+static void egl_cleanup(RKDriver *d) {
+    if (d->egl_dpy == EGL_NO_DISPLAY) return;
+    if (d->egl_ctx != EGL_NO_CONTEXT) {
+        if (d->egl_sfc != EGL_NO_SURFACE)
+            eglMakeCurrent(d->egl_dpy, d->egl_sfc, d->egl_sfc, d->egl_ctx);
+        if (d->egl_prog)   { glDeleteProgram(d->egl_prog);   d->egl_prog = 0; }
+        if (d->egl_tex_y)  { glDeleteTextures(1, &d->egl_tex_y);  d->egl_tex_y  = 0; }
+        if (d->egl_tex_uv) { glDeleteTextures(1, &d->egl_tex_uv); d->egl_tex_uv = 0; }
+        /* make the surface non-current before destroying it (EGL contract) */
+        if (d->egl_sfc != EGL_NO_SURFACE) {
+            eglMakeCurrent(d->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            eglDestroySurface(d->egl_dpy, d->egl_sfc);
+            d->egl_sfc = EGL_NO_SURFACE;
+        }
+        eglDestroyContext(d->egl_dpy, d->egl_ctx);
+        d->egl_ctx = EGL_NO_CONTEXT;
+    }
+    eglTerminate(d->egl_dpy);
+    d->egl_dpy = EGL_NO_DISPLAY;
+}
+
+#define EGL_MAX_INIT_TRIES 3   /* X/EGL may come up late; don't retry forever */
+
+static bool egl_ensure(RKDriver *d, Display *xd) {
+    if (d->egl_fails >= EGL_MAX_INIT_TRIES) return false;   /* give up for good */
+    if (d->egl_dpy != EGL_NO_DISPLAY) return true;
+
+    d->egl_dpy = eglGetDisplay((EGLNativeDisplayType)xd);
+    if (d->egl_dpy == EGL_NO_DISPLAY) goto fail;
+    if (!eglInitialize(d->egl_dpy, NULL, NULL)) goto fail;
+
+    const EGLint cfg_attrs[] = {
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RED_SIZE,   8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE,  8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+    EGLint n = 0;
+    if (!eglChooseConfig(d->egl_dpy, cfg_attrs, &d->egl_conf, 1, &n) || n < 1)
+        goto fail;
+
+    const EGLint ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    d->egl_ctx = eglCreateContext(d->egl_dpy, d->egl_conf, EGL_NO_CONTEXT, ctx_attrs);
+    if (d->egl_ctx == EGL_NO_CONTEXT) goto fail;
+
+    LOG("EGL: initialized %s / %s", eglQueryString(d->egl_dpy, EGL_VENDOR) ?: "?",
+                                    eglQueryString(d->egl_dpy, EGL_VERSION) ?: "?");
+    return true;
+
+fail:
+    d->egl_fails++;
+    LOG("EGL: init failed (%x), try %d/%d, will fall back to XPutImage path",
+        eglGetError(), d->egl_fails, EGL_MAX_INIT_TRIES);
+    egl_cleanup(d);   /* unwinds display/context in reverse order */
+    return false;
+}
+
+static bool egl_ensure_gl(RKDriver *d) {
+    if (d->egl_prog) return true;
+    if (d->egl_gl_failed) return false; /* don't retry a broken GL setup per frame */
+
+    GLuint vtx = compile_shader(GL_VERTEX_SHADER, VTX_SRC);
+    GLuint frg = compile_shader(GL_FRAGMENT_SHADER, FRG_SRC);
+    if (!vtx || !frg) {
+        LOG("EGL: shader compile failed (vtx=%u frg=%u)", vtx, frg);
+        if (vtx) glDeleteShader(vtx);   /* avoid leaking the one that compiled */
+        if (frg) glDeleteShader(frg);
+        d->egl_gl_failed = true;
+        return false;
+    }
+    d->egl_prog = glCreateProgram();
+    glAttachShader(d->egl_prog, vtx);
+    glAttachShader(d->egl_prog, frg);
+    glLinkProgram(d->egl_prog);
+    glDeleteShader(vtx);
+    glDeleteShader(frg);
+    GLint linked = GL_FALSE;
+    glGetProgramiv(d->egl_prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        glDeleteProgram(d->egl_prog); d->egl_prog = 0;
+        d->egl_gl_failed = true;
+        return false;
+    }
+
+    glGenTextures(1, &d->egl_tex_y);
+    glGenTextures(1, &d->egl_tex_uv);
+    return true;
+}
+
+/* Import one plane of the NV12 DMA-BUF as an EGLImage. */
+static EGLImageKHR egl_import_plane(RKDriver *d, int fd, uint32_t fourcc,
+                                     int width, int height, int stride, int offset) {
+    static PFNEGLCREATEIMAGEKHRPROC pCreate = NULL;
+    if (!pCreate) {
+        pCreate = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+        if (!pCreate) return EGL_NO_IMAGE_KHR;
+    }
+
+    EGLint attrs[] = {
+        EGL_WIDTH,                  width,
+        EGL_HEIGHT,                 height,
+        EGL_LINUX_DRM_FOURCC_EXT,   (EGLint)fourcc,
+        EGL_DMA_BUF_PLANE0_FD_EXT,      fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,  offset,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,   stride,
+        EGL_NONE
+    };
+    return pCreate(d->egl_dpy, d->egl_ctx, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+}
+
+static bool egl_bind_plane(RKDriver *d, GLuint tex, int fd, uint32_t fourcc,
+                            int width, int height, int stride, int offset) {
+    static PFNEGLDESTROYIMAGEKHRPROC pDestroy = NULL;
+    static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC pTarget = NULL;
+    if (!pDestroy) {
+        pDestroy = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+        pTarget  = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    }
+    if (!pDestroy || !pTarget) return false;
+
+    EGLImageKHR img = egl_import_plane(d, fd, fourcc, width, height, stride, offset);
+    if (img == EGL_NO_IMAGE_KHR) return false;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    pTarget(GL_TEXTURE_2D, (EGLClientBuffer)img);
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        LOG("EGL: glEGLImageTargetTexture2DOES failed (%x), falling back", err);
+        pDestroy(d->egl_dpy, img);
+        return false;
+    }
+    pDestroy(d->egl_dpy, img);
+    return true;
+}
+
+/* Zero-copy draw: import surface DMA-BUF planes and render with GLES. */
+static bool egl_put(RKDriver *d, RKSurface *surf, Drawable draw, int draw_w, int draw_h, int cx, int cy,
+                    unsigned int cw, unsigned int ch, float u0, float v0, float u1, float v1) {
+    if (!egl_ensure(d, d->xdisp)) return false;
+    if (MPP_FRAME_FMT_IS_YUV_10BIT(surf->fmt)) {
+        if (!d->p010_warned) {
+            d->p010_warned = true;
+            LOG("EGL: P010 not supported by zero-copy path, using CPU conversion");
+        }
+        return false;
+    }
+
+    /* Rebuild the window surface when the drawable changed or was resized */
+    bool rebuild = (d->egl_sfc == EGL_NO_SURFACE || d->egl_draw != draw);
+    if (!rebuild) {
+        EGLint sfc_w = 0, sfc_h = 0;
+        rebuild = !eglQuerySurface(d->egl_dpy, d->egl_sfc, EGL_WIDTH, &sfc_w) ||
+                  !eglQuerySurface(d->egl_dpy, d->egl_sfc, EGL_HEIGHT, &sfc_h) ||
+                  sfc_w != (EGLint)draw_w || sfc_h != draw_h;
+    }
+    if (rebuild) {
+        if (d->egl_sfc != EGL_NO_SURFACE) {
+            eglMakeCurrent(d->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            eglDestroySurface(d->egl_dpy, d->egl_sfc);
+            d->egl_sfc = EGL_NO_SURFACE;
+        }
+        d->egl_sfc = eglCreateWindowSurface(d->egl_dpy, d->egl_conf, (EGLNativeWindowType)draw, NULL);
+        if (d->egl_sfc == EGL_NO_SURFACE) {
+            LOG("EGL: eglCreateWindowSurface(0x%lx) failed (%x)", (unsigned long)draw, eglGetError());
+            return false;
+        }
+        d->egl_draw = draw;
+    }
+
+    if (!eglMakeCurrent(d->egl_dpy, d->egl_sfc, d->egl_sfc, d->egl_ctx)) {
+        LOG("EGL: eglMakeCurrent failed (%x)", eglGetError());
+        return false;
+    }
+
+    /* GL objects can only be created once a context is current */
+    if (!egl_ensure_gl(d))
+        return false;
+
+    int prime_fd = surf->prime_fd;
+    int hs = surf->hstride;
+    int vs = surf->vstride;
+    int w  = surf->width;
+    int h  = surf->height;
+    if (!egl_bind_plane(d, d->egl_tex_y,  prime_fd, RK_DRM_FORMAT_R8, w, h, hs, 0) ||
+        !egl_bind_plane(d, d->egl_tex_uv, prime_fd, RK_DRM_FORMAT_GR88, w / 2, h / 2, hs, (size_t)hs * vs)) {
+        if (!surf->egl_import_failed) {
+            surf->egl_import_failed = true;
+            LOG("EGL: dma-buf import failed (%dx%d, AFBC?), surface falls back to CPU path", w, h);
+        }
+        return false;
+    }
+
+    glUseProgram(d->egl_prog);
+    GLint loc_y  = glGetUniformLocation(d->egl_prog, "tex_y");
+    GLint loc_uv = glGetUniformLocation(d->egl_prog, "tex_uv");
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, d->egl_tex_y);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, d->egl_tex_uv);
+    glUniform1i(loc_y, 0);
+    glUniform1i(loc_uv, 1);
+    /* limited-range YUV→RGB, BT.709 for 720p+ else BT.601 (column-major mat3) */
+    static const float cm601[9] = { 1.1644f, 1.1644f, 1.1644f,  0.f, -0.3917f, 2.0172f, 1.5960f, -0.8130f, 0.f };
+    static const float cm709[9] = { 1.1644f, 1.1644f, 1.1644f,  0.f, -0.2126f, 2.1124f, 1.7927f, -0.5329f, 0.f };
+    glUniformMatrix3fv(glGetUniformLocation(d->egl_prog, "u_cmat"), 1, GL_FALSE, (h >= 720) ? cm709 : cm601);
+
+    /* X11 origin is top-left, GL window origin is bottom-left: flip Y */
+    glViewport(cx, draw_h - cy - (int)ch, (GLsizei)cw, (GLsizei)ch);
+    /* quad samples the visible source sub-rect only (no squish on clip) */
+    static const GLfloat quad_pos[] = { -1.f, -1.f,  1.f, -1.f,  -1.f, 1.f,  1.f, 1.f };
+    GLfloat quad_tex[8] = { u0, v1,  u1, v1,  u0, v0,  u1, v0 };
+    GLuint pos = (GLuint)glGetAttribLocation(d->egl_prog, "a_pos");
+    GLuint tco = (GLuint)glGetAttribLocation(d->egl_prog, "a_tex");
+    glVertexAttribPointer(pos, 2, GL_FLOAT, GL_FALSE, 0, quad_pos);
+    glEnableVertexAttribArray(pos);
+    glVertexAttribPointer(tco, 2, GL_FLOAT, GL_FALSE, 0, quad_tex);
+    glEnableVertexAttribArray(tco);
+
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    eglSwapBuffers(d->egl_dpy, d->egl_sfc);
+
+    static PFNEGLCREATESYNCKHRPROC pCreateSync = NULL;
+    static PFNEGLCLIENTWAITSYNCKHRPROC pWaitSync = NULL;
+    static PFNEGLDESTROYSYNCKHRPROC pDestroySync = NULL;
+    if (!pCreateSync) {
+        pCreateSync  = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+        pWaitSync    = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+        pDestroySync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+    }
+    if (pCreateSync && pWaitSync && pDestroySync) {
+        EGLSyncKHR fence = pCreateSync(d->egl_dpy, EGL_SYNC_FENCE_KHR, NULL);
+        if (fence != EGL_NO_SYNC_KHR) {
+            pWaitSync(d->egl_dpy, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
+            pDestroySync(d->egl_dpy, fence);
+        }
+    } else {
+        glFinish(); /* portable fallback */
+    }
+    return true;
+}
+
+static void egl_fini(RKDriver *d) {
+    egl_cleanup(d);
+    d->egl_fails = 0;   /* allow a fresh init cycle after fini */
+}
+
+/* Limited-range YUV→RGB coefficients, rows r/g/b × cols y/u/v in 1/256 fixed point */
+typedef struct { int ry, ru, rv, gy, gu, gv, by, bu, bv; } YuvCoef;
+
+static const YuvCoef COEF_601 = { 298, 0, 409,  298, -100, -208,  298, 516, 0 };
+static const YuvCoef COEF_709 = { 298, 0, 459,  298,  -54, -136,  298, 541, 0 };
+
+static inline uint32_t yuv_to_rgb(const YuvCoef *k, int y, int u, int v) {
+    int c = y - 16, d = u - 128, e = v - 128;
+    int r = (k->ry * c + k->ru * d + k->rv * e + 128) >> 8;
+    int g = (k->gy * c + k->gu * d + k->gv * e + 128) >> 8;
+    int b = (k->by * c + k->bu * d + k->bv * e + 128) >> 8;
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+static void convert_nv12_to_rgb32(const uint8_t *sp, int hs, int vs, bool i10,
+                                  int src_x, int src_y, int src_w, int src_h,
+                                  uint32_t *dst, int dst_w, int dst_h) {
+    int bpp = i10 ? 2 : 1;
+    const uint8_t *uv = sp + (size_t)hs * vs * bpp;
+    const YuvCoef *k = (vs >= 720) ? &COEF_709 : &COEF_601;
+
+    for (int dy = 0; dy < dst_h; dy++) {
+        int sy = src_y + (int)((int64_t)dy * src_h / dst_h);
+        const uint8_t *yrow  = sp + (size_t)sy * hs * bpp + (size_t)src_x * bpp;
+        /* UV has half resolution; rows offset by the src window start */
+        const uint8_t *uvrow = uv + (size_t)(sy / 2) * hs * bpp + (size_t)(src_x / 2) * 2 * bpp;
+
+        for (int dx = 0; dx < dst_w; dx++) {
+            int px = (int)((int64_t)dx * src_w / dst_w);  /* within src window */
+            int y, u, v;
+            if (i10) {
+                /* little-endian 10-bit LE samples, shift down to 8-bit */
+                y = (yrow[px * 2] | (yrow[px * 2 + 1] << 8)) >> 2;
+                u = (uvrow[(px / 2) * 4]     | (uvrow[(px / 2) * 4 + 1] << 8)) >> 2;
+                v = (uvrow[(px / 2) * 4 + 2] | (uvrow[(px / 2) * 4 + 3] << 8)) >> 2;
+            } else {
+                y = yrow[px];
+                u = uvrow[(px / 2) * 2];
+                v = uvrow[(px / 2) * 2 + 1];
+            }
+            dst[dy * dst_w + dx] = yuv_to_rgb(k, y, u, v);
+        }
+    }
+}
 
 static VAStatus rk_PutSurface(VADriverContextP ctx, VASurfaceID s,
                                void *draw, short sx, short sy,
@@ -1532,8 +2049,142 @@ static VAStatus rk_PutSurface(VADriverContextP ctx, VASurfaceID s,
                                unsigned short dw, unsigned short dh,
                                VARectangle *clips, unsigned int nc,
                                unsigned int flags) {
-    (void)ctx;(void)s;(void)draw;(void)sx;(void)sy;(void)sw;(void)sh;
-    (void)dx;(void)dy;(void)dw;(void)dh;(void)clips;(void)nc;(void)flags;
+    (void)clips;(void)nc;(void)flags;
+    RKDriver  *d = drv_from_ctx(ctx);
+    RKSurface *surf = surface_by_id(d, s);
+    if (!surf || !surf->priv_buf) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!draw) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    /* Per VA spec, 0 for sw/sh/dw/dh means "the whole surface" */
+    int src_w  = sw ? sw : surf->width;
+    int src_h  = sh ? sh : surf->height;
+    int dest_w = dw ? dw : surf->width;
+    int dest_h = dh ? dh : surf->height;
+    int src_x = sx, src_y = sy;
+    /* clamp the source rect into the surface */
+    if (src_x < 0) { src_w += src_x; src_x = 0; }
+    if (src_y < 0) { src_h += src_y; src_y = 0; }
+    if (src_x + src_w > surf->width)  src_w = surf->width - src_x;
+    if (src_y + src_h > surf->height) src_h = surf->height - src_y;
+    if (src_w <= 0 || src_h <= 0) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    Display *xd = x11_display(d);
+    if (!xd) {
+        LOG("PutSurface: cannot open X11 display (DISPLAY=%s), "
+            "use a player on the export/EGL path instead", getenv("DISPLAY") ?: "(null)");
+        return VA_STATUS_ERROR_UNKNOWN;
+    }
+
+    /* If decode is in progress, sync now so we render the finished frame */
+    pthread_mutex_lock(&surf->lock);
+    bool needs_sync = !surf->decoded && (surf->ctx_id != 0);
+    pthread_mutex_unlock(&surf->lock);
+    if (needs_sync) {
+        VAStatus st = rk_SyncSurface(ctx, s);
+        if (st != VA_STATUS_SUCCESS) return st;
+    }
+
+    /* Drawable geometry */
+    Window root;
+    int dr_x, dr_y;
+    unsigned int dr_w, dr_h, dr_bw, depth;
+    pthread_mutex_lock(&d->xlock);
+    if (d->terminated) {
+        pthread_mutex_unlock(&d->xlock);
+        return VA_STATUS_ERROR_UNKNOWN;
+    }
+    if (!XGetGeometry(xd, (Drawable)draw, &root, &dr_x, &dr_y, &dr_w, &dr_h, &dr_bw, &depth)) {
+        pthread_mutex_unlock(&d->xlock);
+        LOG("PutSurface: XGetGeometry failed on drawable 0x%lx", (unsigned long)(uintptr_t)draw);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    /* dest ∩ drawable: the visible slice of the destination rect */
+    int right  = dx + dest_w;
+    int bottom = dy + dest_h;
+    if (right <= 0 || bottom <= 0 || dx >= (int)dr_w || dy >= (int)dr_h) {
+        pthread_mutex_unlock(&d->xlock);
+        return VA_STATUS_SUCCESS; /* fully outside the drawable: nothing to draw */
+    }
+    int cx = dx < 0 ? 0 : dx;
+    int cy = dy < 0 ? 0 : dy;
+    int cw = right  - cx; if (cw > (int)dr_w - cx) cw = (int)dr_w - cx;
+    int ch = bottom - cy; if (ch > (int)dr_h - cy) ch = (int)dr_h - cy;
+
+    /* The clipped-away part of the destination rect corresponds
+     * proportionally to the source rect, so crop the source too — otherwise
+     * the whole frame would be squished into the visible slice */
+    int vsrc_x = src_x + (cx - dx) * src_w / dest_w;
+    int vsrc_y = src_y + (cy - dy) * src_h / dest_h;
+    int vsrc_w = (int)((int64_t)cw * src_w / dest_w);
+    int vsrc_h = (int)((int64_t)ch * src_h / dest_h);
+    if (vsrc_x + vsrc_w > src_x + src_w) vsrc_w = src_x + src_w - vsrc_x;
+    if (vsrc_y + vsrc_h > src_y + src_h) vsrc_h = src_y + src_h - vsrc_y;
+    if (vsrc_w <= 0 || vsrc_h <= 0) {
+        pthread_mutex_unlock(&d->xlock);
+        return VA_STATUS_SUCCESS;
+    }
+
+    /* Hold surf->lock for the whole pixel consumption so a concurrent
+     * re-decode (assign_mpp_frame) cannot overwrite the DMA-BUF mid-draw.
+     * Lock order: xlock → surf->lock; no other path nests them differently. */
+    pthread_mutex_lock(&surf->lock);
+    int hs = surf->hstride ? surf->hstride : surf->width;
+    int vs = surf->vstride ? surf->vstride : surf->height;
+    bool i10 = MPP_FRAME_FMT_IS_YUV_10BIT(surf->fmt);
+    int width = surf->width, height = surf->height;
+    int prime_fd = surf->prime_fd;
+    const uint8_t *sp = (const uint8_t *)mpp_buffer_get_ptr(surf->priv_buf);
+
+    /* Preferred zero-copy path: import surface DMA-BUF planes as EGLImages
+     * and render with GLES, sampling only the visible source sub-rect */
+    if (prime_fd > 0 &&
+        egl_put(d, surf, (Drawable)draw, (int)dr_w, (int)dr_h, cx, cy,
+                (unsigned int)cw, (unsigned int)ch, (float)vsrc_x / width, (float)vsrc_y / height,
+                (float)(vsrc_x + vsrc_w) / width, (float)(vsrc_y + vsrc_h) / height)) {
+        pthread_mutex_unlock(&surf->lock);
+        pthread_mutex_unlock(&d->xlock);
+        return VA_STATUS_SUCCESS;
+    }
+
+    /* egl_put may have made its context current before failing; do not mix
+     * that current GL surface with the XPutImage fallback. */
+    if (d->egl_dpy != EGL_NO_DISPLAY)
+        eglMakeCurrent(d->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+    /* CPU fallback: convert NV12/P010 → RGB32 and blit via XPutImage */
+    Visual *vis = DefaultVisual(xd, DefaultScreen(xd));
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(xd, (Window)draw, &wa))
+        vis = wa.visual;   /* match the drawable's real visual */
+    XImage *img = XCreateImage(xd, vis, depth, ZPixmap, 0, NULL, cw, ch, 32, 0);
+    if (!img || img->bits_per_pixel != 32 || img->bytes_per_line != cw * 4) {
+        int bpp = img ? img->bits_per_pixel : 0;
+        int stride = img ? img->bytes_per_line : 0;
+        if (img) XDestroyImage(img);
+        pthread_mutex_unlock(&surf->lock);
+        pthread_mutex_unlock(&d->xlock);
+        LOG("PutSurface: unsupported XImage layout (depth=%u bpp=%d stride=%d want=%d)", depth, bpp, stride, cw * 4);
+        return VA_STATUS_ERROR_UNKNOWN;
+    }
+    img->data = malloc((size_t)img->bytes_per_line * ch);
+    if (!img->data) {
+        XDestroyImage(img);
+        pthread_mutex_unlock(&surf->lock);
+        pthread_mutex_unlock(&d->xlock);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    convert_nv12_to_rgb32(sp, hs, vs, i10, vsrc_x, vsrc_y, vsrc_w, vsrc_h, (uint32_t *)img->data, cw, ch);
+
+    GC gc = DefaultGC(xd, DefaultScreen(xd));
+    XPutImage(xd, (Drawable)draw, gc, img, 0, 0, cx, cy, (unsigned int)cw, (unsigned int)ch);
+    XFlush(xd);
+    free(img->data);   /* free_data=0: XDestroyImage would not free it */
+    img->data = NULL;
+    XDestroyImage(img);
+    pthread_mutex_unlock(&surf->lock);
+    pthread_mutex_unlock(&d->xlock);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1573,6 +2224,9 @@ VAStatus __vaDriverInit_1_20(VADriverContextP ctx)  /* NOLINT */
     RKDriver *d = calloc(1, sizeof(*d));
     if (!d) return VA_STATUS_ERROR_ALLOCATION_FAILED;
     ctx->pDriverData = d;
+    pthread_mutex_init(&d->xlock, NULL);
+    if (!XInitThreads())
+        LOG("WARNING: XInitThreads() unavailable");
 
     ctx->version_major        = VA_MAJOR_VERSION;
     ctx->version_minor        = VA_MINOR_VERSION;

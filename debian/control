@@ -5,6 +5,9 @@ Maintainer: Eduardo García-Mádico Portabella <woodyst@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                libva-dev (>= 2.0),
                librockchip-mpp-dev,
+               libx11-dev,
+               libegl-dev,
+               libgles2-dev,
                pkg-config,
                po-debconf
 Standards-Version: 4.6.2
