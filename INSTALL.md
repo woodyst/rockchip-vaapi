@@ -47,7 +47,8 @@ To uninstall: `sudo dpkg -r rockchip-vaapi`.
 ### 1. Install build dependencies
 
 ```bash
-sudo apt install gcc pkg-config libva-dev librockchip-mpp-dev
+sudo apt install gcc pkg-config libva-dev librockchip-mpp-dev \
+                 libx11-dev libegl-dev libgles2-dev
 ```
 
 ### 2. Build
